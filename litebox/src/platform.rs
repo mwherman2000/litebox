@@ -1,9 +1,10 @@
 //! The underlying platform upon which LiteBox resides.
 
 use either::Either;
+use thiserror::Error;
 
 /// A provider of a platform upon which LiteBox can execute.
-pub trait Provider {
+pub trait Provider: IPInterfaceProvider {
     /// Punch through any functionality that is not explicitly part of the common shared
     /// platform interface. See [`Punchthrough`] for details.
     type Punchthrough: Punchthrough;
@@ -23,7 +24,7 @@ pub trait Punchthrough {
 }
 
 /// Possible errors for a [`Punchthrough`]
-#[derive(thiserror::Error, Debug)]
+#[derive(Error, Debug)]
 pub enum PunchthroughError<E: core::error::Error> {
     #[error("attempted to execute unsupported punchthrough")]
     Unsupported,
@@ -34,7 +35,7 @@ pub enum PunchthroughError<E: core::error::Error> {
 }
 
 /// An error-implementing [`Either`]-style type.
-#[derive(thiserror::Error, Debug)]
+#[derive(Error, Debug)]
 pub enum EitherError<L: core::error::Error, R: core::error::Error> {
     #[error(transparent)]
     Left(L),
@@ -116,3 +117,30 @@ pub enum UnblockedOrTimedOut {
     /// Sufficient time elapsed without a wake call
     TimedOut,
 }
+
+/// An IP packet interface to the outside world.
+///
+/// This could be implemented via a `read`/`write` to a TUN device.
+pub trait IPInterfaceProvider {
+    /// Send the IP packet.
+    ///
+    /// Returns `Ok(())` when entire packet is sent, or a [`SendError`] if it is unable to send the
+    /// entire packet.
+    fn send_ip_packet(&self, packet: &[u8]) -> Result<usize, SendError>;
+
+    /// Receive an IP packet into `packet`.
+    ///
+    /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
+    /// packet.
+    fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+}
+
+/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum SendError {}
+
+/// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::recv`].
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ReceiveError {}
