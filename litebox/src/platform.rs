@@ -1,12 +1,18 @@
 //! The underlying platform upon which LiteBox resides.
+//!
+//! The top-level trait that denotes something is a valid LiteBox platform is [`Provider`]. This
+//! trait is merely a collection of subtraits that could be composed independently from various
+//! other crates that implement them upon various types.
 
 use either::Either;
 use thiserror::Error;
 
 /// A provider of a platform upon which LiteBox can execute.
-pub trait Provider: RawMutexProvider + IPInterfaceProvider {
-    /// Punch through any functionality that is not explicitly part of the common shared
-    /// platform interface. See [`Punchthrough`] for details.
+pub trait Provider: RawMutexProvider + IPInterfaceProvider + PunchthroughProvider {}
+
+/// Punch through any functionality for a particular platform that is not explicitly part of the
+/// common _shared_ platform interface.
+pub trait PunchthroughProvider {
     type Punchthrough: Punchthrough;
 }
 
