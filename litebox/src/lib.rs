@@ -13,10 +13,6 @@
 
 extern crate alloc;
 
+pub mod fs;
+pub mod net;
 pub mod platform;
-
-/// File-system related functionality
-pub mod fs {}
-
-/// Network-related functionality
-pub mod net {}
