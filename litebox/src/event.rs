@@ -1,11 +1,5 @@
 //! Events related functionality
 
-// TODO(jayb): This doesn't actually seem implementable given the current platform interface; should
-// this itself be moved into the platform interface? Is there a narrower thing we can move in there?
-//
-// Roughly speaking, all the platform needs to provide is the "register", "unregister", and
-// "wait_timeout"; rest of it can be built on top of that.
-
 use thiserror::Error;
 
 use crate::{
