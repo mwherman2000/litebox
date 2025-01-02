@@ -55,15 +55,20 @@ impl<Platform: platform::RawMutexProvider + 'static> EventManager<Platform> {
     /// are satisfied.
     #[must_use]
     pub fn register<'b>(&mut self, builder: &'b WaitableBuilder) -> Waitable<'b, Platform> {
-        let rm = Arc::new(self.platform.new_raw_mutex());
-        rm.underlying_atomic()
+        let triggered_events = Arc::new(self.platform.new_raw_mutex());
+        triggered_events
+            .underlying_atomic()
             .store(Events::empty().bits(), Relaxed);
-        let index = self.triggered_events.insert(rm.clone());
+        let index = self.triggered_events.insert(triggered_events.clone());
         self.fd_to_indexes
             .entry(builder.raw_fd)
             .or_default()
             .push(index);
-        Waitable { rm, builder, index }
+        Waitable {
+            triggered_events,
+            builder,
+            index,
+        }
     }
 
     /// Release registration. Note that this is a private function that is automatically invoked
@@ -89,9 +94,11 @@ impl<Platform: platform::RawMutexProvider + 'static> EventManager<Platform> {
             return;
         };
         for &idx in idxs {
-            let rm = self.triggered_events.get(idx).unwrap();
-            rm.underlying_atomic().fetch_or(events.bits(), SeqCst);
-            rm.wake_all();
+            let triggered_events = self.triggered_events.get(idx).unwrap();
+            triggered_events
+                .underlying_atomic()
+                .fetch_or(events.bits(), SeqCst);
+            triggered_events.wake_all();
         }
     }
 
@@ -166,7 +173,7 @@ impl WaitableBuilder {
 /// [`wait`](Self::wait).
 pub struct Waitable<'b, Platform: RawMutexProvider> {
     // A reference to the underlying raw-mutex used for communicating the events
-    rm: Arc<Platform::RawMutex>,
+    triggered_events: Arc<Platform::RawMutex>,
     // An immutable reference to the builder prevents modification of the choice of events or such
     // until de-registered by dropping.
     builder: &'b WaitableBuilder,
@@ -182,23 +189,28 @@ impl<Platform: RawMutexProvider> Waitable<'_, Platform> {
         timeout: Option<core::time::Duration>,
     ) -> Result<Events, WaitError> {
         // Clear out anything that isn't part of the events we care about
-        self.rm
+        self.triggered_events
             .underlying_atomic()
             .fetch_and(self.builder.polled_events().complement().bits(), SeqCst);
 
         // Now actually wait as necessary
         if let Some(timeout) = timeout {
-            match self.rm.block_or_timeout(Events::empty().bits(), timeout) {
+            match self
+                .triggered_events
+                .block_or_timeout(Events::empty().bits(), timeout)
+            {
                 Ok(UnblockedOrTimedOut::Unblocked) | Err(ImmediatelyWokenUp {}) => {
                     Ok(self.builder.polled_events()
-                        & Events::from_bits(self.rm.underlying_atomic().load(SeqCst)).unwrap())
+                        & Events::from_bits(self.triggered_events.underlying_atomic().load(SeqCst))
+                            .unwrap())
                 }
                 Ok(UnblockedOrTimedOut::TimedOut) => Err(WaitError::TimeOut),
             }
         } else {
-            match self.rm.block(Events::empty().bits()) {
+            match self.triggered_events.block(Events::empty().bits()) {
                 Ok(()) | Err(ImmediatelyWokenUp {}) => Ok(self.builder.polled_events()
-                    & Events::from_bits(self.rm.underlying_atomic().load(SeqCst)).unwrap()),
+                    & Events::from_bits(self.triggered_events.underlying_atomic().load(SeqCst))
+                        .unwrap()),
             }
         }
     }
@@ -240,7 +252,7 @@ impl<Platform: RawMutexProvider> Waitable<'_, Platform> {
     ///
     /// Explicitly *not* exposed as a public API, but only as a crate-internal.
     pub(crate) fn mark_events_as_handled(&self) {
-        self.rm
+        self.triggered_events
             .underlying_atomic()
             .fetch_and(self.builder.polled_events().complement().bits(), SeqCst);
     }
