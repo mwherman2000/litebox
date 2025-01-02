@@ -131,8 +131,8 @@ pub trait RawMutex: Send + Sync {
     /// If the underlying value is `val`, block until a wake operation wakes us up.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
 
-    /// Block until a wake operation wakes us up, or some `time` has passed without a wake operation
-    /// having occured.
+    /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
+    /// has passed without a wake operation having occured.
     fn block_or_timeout(
         &self,
         val: u32,
