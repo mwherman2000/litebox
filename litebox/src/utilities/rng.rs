@@ -30,7 +30,7 @@ impl FastRng {
         x ^= x << 25;
         x ^= x >> 27;
         self.state = x;
-        x * Self::MAGIC
+        x.wrapping_mul(Self::MAGIC)
     }
 
     /// Obtain a pseudo-random `u32` value
