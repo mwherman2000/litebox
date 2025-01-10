@@ -10,8 +10,8 @@ pub(crate) enum InternalFd {
 
 /// An owned file descriptor for files.
 ///
-/// This file descriptor **must** be consumed by a `close` operation, otherwise will panic at
-/// run-time upon being dropped.
+/// This file descriptor **must** be consumed by a `close` operation. Otherwise, (when using crate
+/// feature `panic_on_unclosed_fd_drop`), will panic if dropped without closing.
 pub struct FileFd {
     pub(crate) x: OwnedFd,
 }
@@ -26,8 +26,8 @@ impl FileFd {
 
 /// An owned file descriptor for sockets.
 ///
-/// This file descriptor **must** be consumed by a `close` operation, otherwise will panic at
-/// run-time upon being dropped.
+/// This file descriptor **must** be consumed by a `close` operation. Otherwise, (when using crate
+/// feature `panic_on_unclosed_fd_drop`), will panic if dropped without closing.
 pub struct SocketFd {
     pub(crate) x: OwnedFd,
 }
@@ -43,7 +43,6 @@ impl SocketFd {
 /// An explicitly-private shared-common element of `FileFd` and `SocketFd`, allowing convenient re-implementation.
 ///
 /// Denotes an owned (non-clonable) token of ownership over a file descriptor.
-// TODO: Remove the old OwnedFd, and rename XOwnedFd to OwnedFd
 pub(crate) struct OwnedFd {
     raw: u32,
     closed: bool,
@@ -85,6 +84,7 @@ impl Drop for OwnedFd {
         } else {
             // The owned fd is dropped without being consumed by a `close` operation that has
             // properly marked it as being safely closed
+            #[cfg(feature = "panic_on_unclosed_fd_drop")]
             panic!("Un-closed OwnedFd ({}) being dropped", self.raw)
         }
     }
