@@ -2,7 +2,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::net::SocketAddr;
+use core::net::{Ipv4Addr, SocketAddr};
 
 use crate::fd::SocketFd;
 use crate::platform;
@@ -20,6 +20,14 @@ use errors::{
     SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
+
+/// IP address for LiteBox interface
+// TODO: Make this configurable
+const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+
+/// IP address for the gateway
+// TODO: Make this configurable
+const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 
 /// Maximum number of sockets that can ever be active
 const MAX_NUMBER_OF_SOCKETS: usize = 1024;
@@ -63,8 +71,24 @@ impl<'platform, Platform: platform::IPInterfaceProvider + platform::TimeProvider
     pub fn new(platform: &'platform Platform) -> Self {
         let mut device = phy::Device::new(platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
-        let interface =
+        let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+        interface.update_ip_addrs(|ip_addrs| {
+            match ip_addrs.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
+                24,
+            )) {
+                Ok(()) => {}
+                Err(_) => unreachable!(),
+            }
+        });
+        match interface
+            .routes_mut()
+            .add_default_ipv4_route(GATEWAY_IP_ADDR)
+        {
+            Ok(None) => {}
+            _ => unreachable!(),
+        }
         Self {
             platform,
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
@@ -370,8 +394,13 @@ impl<Platform: platform::IPInterfaceProvider + platform::TimeProvider> Network<'
             Protocol::Tcp => {
                 let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 let local_port = self.local_port_allocator.ephemeral_port()?;
-                let local_endpoint = local_port.port();
-                socket.connect(self.interface.context(), *addr, local_endpoint);
+                let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
+                let addr: smoltcp::wire::IpEndpoint = (*addr).into();
+                match socket.connect(self.interface.context(), addr, local_endpoint) {
+                    Ok(()) => {}
+                    Err(tcp::ConnectError::InvalidState) => unreachable!(),
+                    Err(tcp::ConnectError::Unaddressable) => todo!(),
+                }
                 let old_port =
                     core::mem::replace(&mut socket_handle.tcp_mut().local_port, Some(local_port));
                 if old_port.is_some() {
