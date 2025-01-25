@@ -5,6 +5,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::marker::PhantomData;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
@@ -18,17 +19,52 @@ use litebox::platform::UnblockedOrTimedOut;
 /// traits. Notably, however, it supports parametric punchtrough (defaulted to impossible
 /// punchtrough).
 pub struct LinuxUserland<Punchthrough: litebox::platform::Punchthrough = litebox::platform::trivial_providers::ImpossiblePunchthrough> {
-    __private: (),
+    tun_socket_fd: std::os::fd::OwnedFd,
     punchthrough: PhantomData<Punchthrough>,
 }
 
 impl LinuxUserland {
     /// Create a new userland-Linux platform for use in `LiteBox`.
-    // TODO(jayb) Add support for configuring the tun interface.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    ///
+    /// Takes a tun device name (such as `"tun0"` or `"tun99"`) to connect networking.
+    pub fn new(tun_device_name: &str) -> Self {
+        let tun_socket_fd = {
+            let tun_fd = nix::fcntl::open(
+                "/dev/net/tun",
+                nix::fcntl::OFlag::O_RDWR
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::empty(),
+            )
+            .unwrap();
+
+            nix::ioctl_write_ptr!(tunsetiff, b'T', 202, ::core::ffi::c_int);
+            let ifreq = libc::ifreq {
+                ifr_name: {
+                    let mut name = [0i8; 16];
+                    assert!(tun_device_name.len() < 16); // Note: strictly-less-than 16, to ensure it fits
+                    for (i, b) in tun_device_name.char_indices() {
+                        let b = b as u32;
+                        assert!(b < 128);
+                        name[i] = b as i8;
+                    }
+                    name
+                },
+                ifr_ifru: nix::libc::__c_anonymous_ifr_ifru {
+                    ifru_flags: nix::libc::IFF_TUN as i16,
+                },
+            };
+            let ifreq: *const libc::ifreq = &ifreq as _;
+            let ifreq: *const i32 = ifreq as _;
+            unsafe { tunsetiff(tun_fd, ifreq) }.unwrap();
+
+            // By taking ownership, we are letting the drop handler automatically run `libc::close`
+            // when necessary.
+            unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) }
+        };
+
         Self {
-            __private: (),
+            tun_socket_fd,
             punchthrough: PhantomData,
         }
     }
@@ -260,14 +296,30 @@ impl<Punchthrough: litebox::platform::Punchthrough> litebox::platform::IPInterfa
     for LinuxUserland<Punchthrough>
 {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        todo!("TODO: Send packet of length {}", packet.len())
+        match nix::unistd::write(&self.tun_socket_fd, packet) {
+            Ok(size) => {
+                if size != packet.len() {
+                    unimplemented!()
+                }
+                Ok(())
+            }
+            Err(errno) => {
+                unimplemented!("unexpected error {}", errno)
+            }
+        }
     }
 
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        todo!("TODO: Receive into buffer of length {}", packet.len())
+        nix::unistd::read(self.tun_socket_fd.as_raw_fd(), packet).map_err(|errno| {
+            if errno == nix::Error::EWOULDBLOCK || errno == nix::Error::EAGAIN {
+                litebox::platform::ReceiveError::WouldBlock
+            } else {
+                unimplemented!("unexpected error {}", errno)
+            }
+        })
     }
 }
 
