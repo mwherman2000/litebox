@@ -1,6 +1,7 @@
 //! An in-memory file system, not backed by any physical device.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use hashbrown::HashMap;
 
 use crate::path::Arg;
@@ -22,7 +23,7 @@ pub struct FileSystem<'platform, Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
     sync: sync::Synchronization<'platform, Platform>,
-    root: sync::RwLock<'platform, Platform, RootDir>,
+    root: sync::RwLock<'platform, Platform, RootDir<'platform, Platform>>,
     current_user: UserInfo,
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
@@ -37,7 +38,7 @@ impl<'platform, Platform: sync::RawSyncPrimitivesProvider> FileSystem<'platform,
     #[must_use]
     pub fn new(platform: &'platform Platform) -> Self {
         let sync = sync::Synchronization::new(platform);
-        let root = sync.new_rwlock(RootDir::new());
+        let root = sync.new_rwlock(RootDir::new(&sync));
         Self {
             sync,
             root,
@@ -98,22 +99,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (_, entry) = root.parent_and_entry_mut(&path, self.current_user)?;
+        let (_, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some(entry) = entry else {
             return Err(PathError::NoSuchFileOrDirectory)?;
         };
-        let perms = entry.perms_mut();
-        if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
-            return Err(ChmodError::NotTheOwner);
+        match entry {
+            Entry::File(file) => {
+                let perms = &mut file.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
+            Entry::Dir(dir) => {
+                let perms = &mut dir.write().perms;
+                if !(self.current_user.user == 0 || self.current_user.user == perms.userinfo.user) {
+                    return Err(ChmodError::NotTheOwner);
+                }
+                perms.mode = mode;
+                Ok(())
+            }
         }
-        perms.mode = mode;
-        Ok(())
     }
 
     fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry_mut(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(UnlinkError::IsADirectory);
@@ -124,6 +137,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         if let Entry::Dir(_) = entry {
             return Err(UnlinkError::IsADirectory);
         };
+        let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(UnlinkError::NoWritePerms);
         }
@@ -137,7 +151,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry_mut(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((parent_path, parent)) = parent else {
             // Attempted to make `/`
             return Err(MkdirError::AlreadyExists);
@@ -145,19 +159,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let None = entry else {
             return Err(MkdirError::AlreadyExists);
         };
+        let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(MkdirError::NoWritePerms);
         };
         parent.children_count = parent.children_count.checked_add(1).unwrap();
         let old = root.entries.insert(
             path,
-            Entry::Dir(Dir {
+            Entry::Dir(Arc::new(self.sync.new_rwlock(DirX {
                 perms: Permissions {
                     mode,
                     userinfo: self.current_user,
                 },
                 children_count: 0,
-            }),
+            }))),
         );
         Ok(())
     }
@@ -165,7 +180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
         let path = self.absolute_path(path)?;
         let mut root = self.root.write();
-        let (parent, entry) = root.parent_and_entry_mut(&path, self.current_user)?;
+        let (parent, entry) = root.parent_and_entry(&path, self.current_user)?;
         let Some((_, parent)) = parent else {
             // Attempted to remove `/`
             return Err(RmdirError::Busy);
@@ -176,30 +191,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         let Entry::Dir(dir) = entry else {
             return Err(RmdirError::NotADirectory);
         };
-        if dir.children_count > 0 {
+        if dir.read().children_count > 0 {
             return Err(RmdirError::NotEmpty);
         }
+        let mut parent = parent.write();
         if !self.current_user.can_write(&parent.perms) {
             return Err(RmdirError::NoWritePerms);
         }
         parent.children_count = parent.children_count.checked_sub(1).unwrap();
         let removed = root.entries.remove(&path).unwrap();
         // Just a sanity check
-        assert!(matches!(
-            removed,
-            Entry::Dir(Dir {
-                children_count: 0,
-                ..
-            })
-        ));
+        assert!(matches!(removed, Entry::Dir(_)));
         Ok(())
     }
 }
 
-struct RootDir {
+struct RootDir<'platform, Platform: sync::RawSyncPrimitivesProvider> {
     // keys are normalized paths; directories do not have the final `/` (thus the root would be at
     // the empty-string key "")
-    entries: HashMap<String, Entry>,
+    entries: HashMap<String, Entry<'platform, Platform>>,
 }
 
 // Parent, if it exists, is the path as well as the directory
@@ -207,25 +217,29 @@ struct RootDir {
 // The entry, if it exists, is just the entry itself
 type ParentAndEntry<'a, D, E> = Result<(Option<(&'a str, D)>, Option<E>), PathError>;
 
-impl RootDir {
-    fn new() -> Self {
+impl<'platform, Platform: sync::RawSyncPrimitivesProvider> RootDir<'platform, Platform> {
+    fn new(sync: &sync::Synchronization<'platform, Platform>) -> Self {
         Self {
             entries: [(
                 String::new(),
-                Entry::Dir(Dir {
+                Entry::Dir(Arc::new(sync.new_rwlock(DirX {
                     perms: Permissions {
                         mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::WOTH,
                         userinfo: UserInfo { user: 0, group: 0 },
                     },
                     children_count: 0,
-                }),
+                }))),
             )]
             .into_iter()
             .collect(),
         }
     }
 
-    fn parent_and_entry(&self, path: &str, current_user: UserInfo) -> ParentAndEntry<&Dir, &Entry> {
+    fn parent_and_entry(
+        &self,
+        path: &str,
+        current_user: UserInfo,
+    ) -> ParentAndEntry<Dir<'platform, Platform>, Entry<'platform, Platform>> {
         let mut real_components_seen = false;
         let mut collected = String::new();
         let mut parent_dir = None;
@@ -245,86 +259,43 @@ impl RootDir {
             {
                 (_, Entry::File(_)) => return Err(PathError::ComponentNotADirectory),
                 (parent_path, Entry::Dir(dir)) => {
-                    if !current_user.can_execute(&dir.perms) {
+                    if !current_user.can_execute(&dir.read().perms) {
                         return Err(PathError::NoSearchPerms);
                     }
-                    parent_dir = Some((parent_path.as_str(), dir));
+                    parent_dir = Some((parent_path.as_str(), dir.clone()));
                 }
             }
             collected += "/";
             collected += p;
         }
-        Ok((parent_dir, self.entries.get(&collected)))
-    }
-    fn parent_and_entry_mut(
-        &mut self,
-        path: &str,
-        current_user: UserInfo,
-    ) -> ParentAndEntry<&mut Dir, &mut Entry> {
-        let mut real_components_seen = false;
-        let mut collected = String::new();
-        let mut parent_path = None;
-        for p in path.normalized_components()? {
-            if p.is_empty() || p == ".." {
-                // After normalization, these can only be at the start of the path, so can all be
-                // ignored. We do an `assert` here mostly as a sanity check.
-                assert!(!real_components_seen);
-                continue;
-            }
-            // We have seen real components, should no longer see any empty or `/`s.
-            real_components_seen = true;
-            match self
-                .entries
-                .get_mut(&collected)
-                .ok_or(PathError::MissingComponent)?
-            {
-                Entry::File(_) => return Err(PathError::ComponentNotADirectory),
-                Entry::Dir(dir) => {
-                    if !current_user.can_execute(&dir.perms) {
-                        return Err(PathError::NoSearchPerms);
-                    }
-                    parent_path = Some(collected.clone());
-                }
-            }
-            collected += "/";
-            collected += p;
-        }
-        if let Some(parent_path) = parent_path {
-            let [parent_path_and_entry, main_path_and_entry] = self
-                .entries
-                .get_many_key_value_mut([&parent_path, &collected]);
-            let (parent_path, parent_dir) = match parent_path_and_entry.unwrap() {
-                (_, Entry::File(_)) => unreachable!(),
-                (path, Entry::Dir(dir)) => (path, dir),
-            };
-            let main_entry = main_path_and_entry.map(|(_, e)| e);
-            Ok((Some((parent_path, parent_dir)), main_entry))
-        } else {
-            Ok((None, self.entries.get_mut(&collected)))
-        }
+        Ok((parent_dir, self.entries.get(&collected).cloned()))
     }
 }
 
-enum Entry {
-    File(File),
-    Dir(Dir),
+enum Entry<'platform, Platform: sync::RawSyncPrimitivesProvider> {
+    File(File<'platform, Platform>),
+    Dir(Dir<'platform, Platform>),
 }
 
-impl Entry {
-    fn perms_mut(&mut self) -> &mut Permissions {
+impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Entry<'_, Platform> {
+    fn clone(&self) -> Self {
         match self {
-            Entry::File(file) => &mut file.perms,
-            Entry::Dir(dir) => &mut dir.perms,
+            Self::File(file) => Self::File(file.clone()),
+            Self::Dir(dir) => Self::Dir(dir.clone()),
         }
     }
 }
 
-struct Dir {
+type Dir<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, DirX>>;
+
+struct DirX {
     perms: Permissions,
     children_count: u32,
 }
 
-struct File {
+type File<'platform, Platform> = Arc<sync::RwLock<'platform, Platform, FileX>>;
+
+struct FileX {
     perms: Permissions,
     // TODO: Actual data
 }
