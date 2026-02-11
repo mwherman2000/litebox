@@ -24,7 +24,7 @@ Example use cases include:
 
 ## FAQ
 
-Frequently Asked Questions: [](./.faq)
+Frequently Asked Questions [List](./.faq)
 
 ## Contributing
 
